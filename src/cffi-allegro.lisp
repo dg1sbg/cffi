@@ -238,6 +238,38 @@ WITH-POINTER-TO-VECTOR-DATA."
       (let ((ftype (convert-foreign-type cffi-type)))
         (list ftype (convert-to-lisp-type ftype)))))
 
+;;; SYSTEM::FF_FUNCALL reads a return as its C type only when its Lisp type is INTEGER-headed.
+(defun allegro-integer-type (lisp-type)
+  "Return the (INTEGER LO HI) the (SIGNED-BYTE N) LISP-TYPE names."
+  (destructuring-bind (head bits) lisp-type
+    (ecase head
+      (signed-byte `(integer ,(- (ash 1 (1- bits))) ,(1- (ash 1 (1- bits))))))))
+
+(defun allegro-return-pair (rettype)
+  "Return the pair a RETTYPE return is read with, (C-TYPE LISP-TYPE) or
+ALLEGRO-TYPE-PAIR's (:FOREIGN-ADDRESS) for :POINTER, and as a second value
+the width in bits a narrow signed RETTYPE is then sign-extended from, or NIL."
+  (case rettype
+    ((:char :short)
+     (values (allegro-return-pair :int)
+             (* 8 (ff:sizeof-fobject (convert-foreign-type rettype)))))
+    ((:int :long :long-long)
+     (let ((ftype (convert-foreign-type rettype)))
+       (values (list ftype (allegro-integer-type (convert-to-lisp-type ftype)))
+               nil)))
+    (t (values (allegro-type-pair rettype) nil))))
+
+(defun allegro-return-form (rettype call)
+  "Return CALL, a form reading a RETTYPE return with ALLEGRO-RETURN-PAIR's pair,
+wrapped so that its answer is narrowed to and sign-extended from the width
+ALLEGRO-RETURN-PAIR answers as its second value, or CALL itself when that is NIL."
+  (let ((bits (nth-value 1 (allegro-return-pair rettype))))
+    (if (null bits)
+        call
+        (let ((half (ash 1 (1- bits))))
+          ;; branch-free, undeclared: a DECLARE costs ~100 ns a call at safety >= 2
+          `(- (logxor (logand (the (signed-byte 32) ,call) ,(1- (ash 1 bits))) ,half) ,half)))))
+
 #+ignore
 (defun note-named-foreign-function (symbol name types rettype)
   "Give Allegro's compiler a hint to perform a direct call."
@@ -257,20 +289,22 @@ WITH-POINTER-TO-VECTOR-DATA."
   (declare (ignore convention library))
   (multiple-value-bind (types fargs rettype)
       (foreign-funcall-type-and-args args)
-    `(#+(version>= 11 0) system::ff_funcall
-      #-(version>= 11 0) system::ff-funcall
-      (load-time-value (excl::determine-foreign-address
-                        '(,name :language :c)
-                        #-(version>= 8 1) ff::ep-flag-never-release
-                        #+(version>= 8 1) ff::ep-flag-always-release
-                        nil ; method-index
-                        ))
-      ;; arg types {'(:c-type lisp-type) argN}*
-      ,@(mapcan (lambda (type arg)
-                  `(',(allegro-type-pair type) ,arg))
-                types fargs)
-      ;; return type '(:c-type lisp-type)
-      ',(allegro-type-pair rettype))))
+    (allegro-return-form
+     rettype
+     `(#+(version>= 11 0) system::ff_funcall
+       #-(version>= 11 0) system::ff-funcall
+       (load-time-value (excl::determine-foreign-address
+                         '(,name :language :c)
+                         #-(version>= 8 1) ff::ep-flag-never-release
+                         #+(version>= 8 1) ff::ep-flag-always-release
+                         nil ; method-index
+                         ))
+       ;; arg types {'(:c-type lisp-type) argN}*
+       ,@(mapcan (lambda (type arg)
+                   `(',(allegro-type-pair type) ,arg))
+                 types fargs)
+       ;; return type '(:c-type lisp-type)
+       ',(allegro-return-pair rettype)))))
 
 (defun defcfun-helper-forms (name lisp-name rettype args types options)
   "Return 2 values for DEFCFUN. A prelude form and a caller form."
@@ -280,7 +314,7 @@ WITH-POINTER-TO-VECTOR-DATA."
       `(ff:def-foreign-call (,ff-name ,name)
            ,(loop for type in types
                   collect (list* (gensym) (allegro-type-pair type)))
-         :returning ,(allegro-type-pair rettype)
+         :returning ,(allegro-return-pair rettype)
          ;; Don't use call-direct when there are no arguments.
          ,@(unless (null args) '(:call-direct t))
          :arg-checking nil
@@ -288,7 +322,7 @@ WITH-POINTER-TO-VECTOR-DATA."
          #+(version>= 8 1) ,@'(:release-heap :when-ok
                                :release-heap-ignorable t)
          #+smp ,@'(:release-heap-implies-allow-gc t))
-      `(,ff-name ,@args))))
+      (allegro-return-form rettype `(,ff-name ,@args)))))
 
 ;;; See doc/allegro-internals.txt for a clue about entry-vec.
 (defmacro %foreign-funcall-pointer (ptr args &key convention)
@@ -296,17 +330,19 @@ WITH-POINTER-TO-VECTOR-DATA."
   (multiple-value-bind (types fargs rettype)
       (foreign-funcall-type-and-args args)
     (with-unique-names (entry-vec)
-      `(let ((,entry-vec (excl::make-entry-vec-boa)))
-         (setf (aref ,entry-vec 1) ,ptr) ; set jump address
-         (#+(version>= 11 0) system::ff_funcall
-          #-(version>= 11 0) system::ff-funcall
-          ,entry-vec
-          ;; arg types {'(:c-type lisp-type) argN}*
-          ,@(mapcan (lambda (type arg)
-                      `(',(allegro-type-pair type) ,arg))
-                    types fargs)
-          ;; return type '(:c-type lisp-type)
-          ',(allegro-type-pair rettype))))))
+      (allegro-return-form
+       rettype
+       `(let ((,entry-vec (excl::make-entry-vec-boa)))
+          (setf (aref ,entry-vec 1) ,ptr) ; set jump address
+          (#+(version>= 11 0) system::ff_funcall
+           #-(version>= 11 0) system::ff-funcall
+           ,entry-vec
+           ;; arg types {'(:c-type lisp-type) argN}*
+           ,@(mapcan (lambda (type arg)
+                       `(',(allegro-type-pair type) ,arg))
+                     types fargs)
+           ;; return type '(:c-type lisp-type)
+           ',(allegro-return-pair rettype)))))))
 
 ;;;# Callbacks
 
