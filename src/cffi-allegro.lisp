@@ -238,7 +238,7 @@ WITH-POINTER-TO-VECTOR-DATA."
       (let ((ftype (convert-foreign-type cffi-type)))
         (list ftype (convert-to-lisp-type ftype)))))
 
-;;; SYSTEM::FF_FUNCALL reads a return as its C type only when its Lisp type is INTEGER-headed.
+;;; SYSTEM::FF_FUNCALL honours a return's C type only for an INTEGER-headed Lisp type, zero-extends :CHAR and never narrows :UNSIGNED-INT.
 (defun allegro-integer-type (lisp-type)
   "Return the (INTEGER LO HI) the (SIGNED-BYTE N) LISP-TYPE names."
   (destructuring-bind (head bits) lisp-type
@@ -248,11 +248,12 @@ WITH-POINTER-TO-VECTOR-DATA."
 (defun allegro-return-pair (rettype)
   "Return the pair a RETTYPE return is read with, (C-TYPE LISP-TYPE) or
 ALLEGRO-TYPE-PAIR's (:FOREIGN-ADDRESS) for :POINTER, and as a second value
-the width in bits a narrow signed RETTYPE is then sign-extended from, or NIL."
+the (SIGNED-BYTE n) or (UNSIGNED-BYTE n) a narrow RETTYPE, read with the :INT
+pair, is then narrowed to in Lisp, or NIL."
   (case rettype
-    ((:char :short)
+    ((:char :short :unsigned-char :unsigned-short :unsigned-int)
      (values (allegro-return-pair :int)
-             (* 8 (ff:sizeof-fobject (convert-foreign-type rettype)))))
+             (convert-to-lisp-type (convert-foreign-type rettype))))
     ((:int :long :long-long)
      (let ((ftype (convert-foreign-type rettype)))
        (values (list ftype (allegro-integer-type (convert-to-lisp-type ftype)))
@@ -261,14 +262,19 @@ the width in bits a narrow signed RETTYPE is then sign-extended from, or NIL."
 
 (defun allegro-return-form (rettype call)
   "Return CALL, a form reading a RETTYPE return with ALLEGRO-RETURN-PAIR's pair,
-wrapped so that its answer is narrowed to and sign-extended from the width
-ALLEGRO-RETURN-PAIR answers as its second value, or CALL itself when that is NIL."
-  (let ((bits (nth-value 1 (allegro-return-pair rettype))))
-    (if (null bits)
+wrapped so that its answer is masked to the width of the Lisp type
+ALLEGRO-RETURN-PAIR answers as its second value and, for a (SIGNED-BYTE n),
+sign-extended from it; or CALL itself when that is NIL."
+  (let ((narrow (nth-value 1 (allegro-return-pair rettype))))
+    (if (null narrow)
         call
-        (let ((half (ash 1 (1- bits))))
-          ;; branch-free, undeclared: a DECLARE costs ~100 ns a call at safety >= 2
-          `(- (logxor (logand (the (signed-byte 32) ,call) ,(1- (ash 1 bits))) ,half) ,half)))))
+        (destructuring-bind (head bits) narrow
+          (let ((low `(logand (the (signed-byte 32) ,call) ,(1- (ash 1 bits))))
+                (half (ash 1 (1- bits))))
+            ;; branch-free, undeclared: a DECLARE costs ~100 ns a call at safety >= 2
+            (ecase head
+              (unsigned-byte low)
+              (signed-byte `(- (logxor ,low ,half) ,half))))))))
 
 #+ignore
 (defun note-named-foreign-function (symbol name types rettype)
