@@ -268,6 +268,23 @@ WITH-POINTER-TO-VECTOR-DATA."
             (nreverse fargs)
             return-type)))
 
+(defun sbcl-return-type (rettype)
+  "Return the alien type a RETTYPE return is read with, and as a second value
+the width in bits that read is then narrowed to, or NIL: on arm64, where SBCL
+leaves the register bits above a narrow unsigned result unmasked, UNSIGNED-CHAR,
+UNSIGNED-SHORT and UNSIGNED-INT are read as (UNSIGNED 64)."
+  #+arm64
+  (let ((bits (case rettype (unsigned-char 8) (unsigned-short 16) (unsigned-int 32))))
+    (if bits (values '(unsigned 64) bits) (values rettype nil)))
+  #-arm64
+  (values rettype nil))
+
+(defun sbcl-return-form (rettype call)
+  "Return CALL, a form reading a RETTYPE return with SBCL-RETURN-TYPE's type,
+narrowed to SBCL-RETURN-TYPE's width when it answers one, else CALL itself."
+  (let ((bits (nth-value 1 (sbcl-return-type rettype))))
+    (if bits `(ldb (byte ,bits 0) ,call) call)))
+
 (defmacro %%foreign-funcall (name types fargs rettype)
   "Internal guts of %FOREIGN-FUNCALL."
   `(alien-funcall
@@ -279,7 +296,9 @@ WITH-POINTER-TO-VECTOR-DATA."
   (declare (ignore library convention))
   (multiple-value-bind (types fargs rettype)
       (foreign-funcall-type-and-args args)
-    `(%%foreign-funcall ,name ,types ,fargs ,rettype)))
+    (sbcl-return-form
+     rettype
+     `(%%foreign-funcall ,name ,types ,fargs ,(sbcl-return-type rettype)))))
 
 (defmacro %foreign-funcall-pointer (ptr args &key convention)
   "Funcall a pointer to a foreign function."
@@ -287,8 +306,10 @@ WITH-POINTER-TO-VECTOR-DATA."
   (multiple-value-bind (types fargs rettype)
       (foreign-funcall-type-and-args args)
     (with-unique-names (function)
-      `(with-alien ((,function (* (function ,rettype ,@types)) ,ptr))
-         (alien-funcall ,function ,@fargs)))))
+      (sbcl-return-form
+       rettype
+       `(with-alien ((,function (* (function ,(sbcl-return-type rettype) ,@types)) ,ptr))
+          (alien-funcall ,function ,@fargs))))))
 
 (defmacro %foreign-funcall-varargs (name fixed-args varargs
                                     &rest args &key convention library)
